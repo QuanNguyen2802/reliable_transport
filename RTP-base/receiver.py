@@ -1,44 +1,207 @@
+
 import argparse
 import socket
+import sys
 
 from utils import PacketHeader, compute_checksum
 
 
+HEADER_SIZE = 16
+MAX_PACKET_SIZE = 1472
+
+
+def parse_packet(pkt):
+    """Extract packet header and payload, then verify checksum."""
+
+    if len(pkt) < HEADER_SIZE or len(pkt) > MAX_PACKET_SIZE:
+        return None
+
+    pkt_header = PacketHeader(pkt[:HEADER_SIZE])
+    msg = pkt[HEADER_SIZE:]
+
+    if pkt_header.type not in (0, 1, 2, 3):
+        return None
+
+    if pkt_header.length != len(msg):
+        return None
+
+    pkt_checksum = pkt_header.checksum
+    pkt_header.checksum = 0
+
+    computed_checksum = compute_checksum(pkt_header / msg)
+
+    if pkt_checksum != computed_checksum:
+        return None
+
+    return pkt_header, msg
+
+
+def send_ack(s, address, seq_num):
+    """Create and send an individual ACK packet."""
+
+    pkt_header = PacketHeader(
+        type=3,
+        seq_num=seq_num,
+        length=0,
+        checksum=0
+    )
+
+    pkt_header.checksum = compute_checksum(pkt_header)
+
+    s.sendto(bytes(pkt_header), address)
+
+
 def receiver(receiver_ip, receiver_port, window_size):
-    """TODO: Listen on socket and print received message to sys.stdout."""
+    """Listen on socket and receive data using individual ACKs."""
+
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind((receiver_ip, receiver_port))
-    while True:
-        # Receive packet; address includes both IP and port
-        pkt, address = s.recvfrom(2048)
 
-        # Extract header and payload
-        pkt_header = PacketHeader(pkt[:16])
-        msg = pkt[16 : 16 + pkt_header.length]
+    active = False
+    sender_address = None
 
-        # Verity checksum
-        pkt_checksum = pkt_header.checksum
-        pkt_header.checksum = 0
-        computed_checksum = compute_checksum(pkt_header / msg)
-        if pkt_checksum != computed_checksum:
-            print("checksums not match")
-        print(msg)
+    # Next expected sequence number
+    expected = 1
+
+    # Buffer for out-of-order packets
+    buffer = {}
+
+    try:
+        while True:
+
+            pkt, address = s.recvfrom(MAX_PACKET_SIZE + 1)
+
+            result = parse_packet(pkt)
+
+            # Drop invalid or corrupted packets
+            if result is None:
+                continue
+
+            pkt_header, msg = result
+
+            # --------------------------------
+            # 1. Handle START packet
+            # --------------------------------
+
+            if pkt_header.type == 0:
+
+                # Ignore START during an active connection
+                if active:
+                    continue
+
+                if pkt_header.seq_num != 0 or pkt_header.length != 0:
+                    continue
+
+                active = True
+                sender_address = address
+
+                expected = 1
+                buffer = {}
+
+                # ACK for START has seq_num = 1
+                send_ack(s, sender_address, 1)
+
+                continue
+
+            # Ignore packets from other senders
+            if not active or address != sender_address:
+                continue
+
+            # --------------------------------
+            # 2. Handle DATA packet
+            # --------------------------------
+
+            if pkt_header.type == 2:
+
+                seq_num = pkt_header.seq_num
+
+                # Handle duplicate packets
+                if seq_num < expected:
+
+                    # ACK this individual packet
+                    send_ack(s, sender_address, seq_num)
+                    continue
+
+                # Drop packets outside the receiving window
+                if seq_num >= expected + window_size:
+                    continue
+
+                # Buffer the packet if not already received
+                if seq_num not in buffer:
+                    buffer[seq_num] = msg
+
+                # Send individual ACK
+                # ACK sequence number equals DATA sequence number
+                send_ack(s, sender_address, seq_num)
+
+                # Deliver all consecutive packets in order
+                while expected in buffer:
+
+                    data = buffer.pop(expected)
+
+                    sys.stdout.buffer.write(data)
+
+                    expected += 1
+
+                sys.stdout.buffer.flush()
+
+            # --------------------------------
+            # 3. Handle END packet
+            # --------------------------------
+
+            elif pkt_header.type == 1:
+
+                if pkt_header.length != 0:
+                    continue
+
+                # Only terminate after all DATA packets are received
+                if pkt_header.seq_num == expected:
+
+                    # ACK for END
+                    send_ack(
+                        s,
+                        sender_address,
+                        pkt_header.seq_num + 1
+                    )
+
+                    sys.stdout.buffer.flush()
+
+                    break
+
+    finally:
+        s.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
-        "receiver_ip", help="The IP address of the host that receiver is running on"
+        "receiver_ip",
+        help="The IP address of the host that receiver is running on"
     )
+
     parser.add_argument(
-        "receiver_port", type=int, help="The port number on which receiver is listening"
+        "receiver_port",
+        type=int,
+        help="The port number on which receiver is listening"
     )
+
     parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
+        "window_size",
+        type=int,
+        help="Maximum number of outstanding packets"
     )
+
     args = parser.parse_args()
 
-    receiver(args.receiver_ip, args.receiver_port, args.window_size)
+    receiver(
+        args.receiver_ip,
+        args.receiver_port,
+        args.window_size
+    )
 
 
 if __name__ == "__main__":
