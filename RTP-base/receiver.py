@@ -52,7 +52,7 @@ def send_ack(s, address, seq_num):
 
 
 def receiver(receiver_ip, receiver_port, window_size):
-    """Listen on socket and receive data using individual ACKs."""
+    """Listen on socket and receive data using cumulative ACKs."""
 
     if window_size <= 0:
         raise ValueError("window_size must be positive")
@@ -72,7 +72,7 @@ def receiver(receiver_ip, receiver_port, window_size):
     try:
         while True:
 
-            pkt, address = s.recvfrom(MAX_PACKET_SIZE + 1)
+            pkt, address = s.recvfrom(2048)
 
             result = parse_packet(pkt)
 
@@ -120,9 +120,7 @@ def receiver(receiver_ip, receiver_port, window_size):
 
                 # Handle duplicate packets
                 if seq_num < expected:
-
-                    # ACK this individual packet
-                    send_ack(s, sender_address, seq_num)
+                    send_ack(s, sender_address, expected)
                     continue
 
                 # Drop packets outside the receiving window
@@ -132,10 +130,6 @@ def receiver(receiver_ip, receiver_port, window_size):
                 # Buffer the packet if not already received
                 if seq_num not in buffer:
                     buffer[seq_num] = msg
-
-                # Send individual ACK
-                # ACK sequence number equals DATA sequence number
-                send_ack(s, sender_address, seq_num)
 
                 # Deliver all consecutive packets in order
                 while expected in buffer:
@@ -147,6 +141,9 @@ def receiver(receiver_ip, receiver_port, window_size):
                     expected += 1
 
                 sys.stdout.buffer.flush()
+
+                # Send cumulative ACK with the next expected seq_num
+                send_ack(s, sender_address, expected)
 
             # --------------------------------
             # 3. Handle END packet
@@ -170,6 +167,9 @@ def receiver(receiver_ip, receiver_port, window_size):
                     sys.stdout.buffer.flush()
 
                     break
+
+                else:
+                    send_ack(s, sender_address, expected)
 
     finally:
         s.close()

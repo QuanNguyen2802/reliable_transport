@@ -13,11 +13,14 @@ MAX_PACKET_SIZE = 1472
 def parse_packet(pkt):
     """Extract packet header and payload, then verify checksum."""
 
-    if len(pkt) < HEADER_SIZE:
+    if len(pkt) < HEADER_SIZE or len(pkt) > MAX_PACKET_SIZE:
         return None
 
     pkt_header = PacketHeader(pkt[:HEADER_SIZE])
     msg = pkt[HEADER_SIZE:]
+
+    if pkt_header.type not in (0, 1, 2, 3):
+        return None
 
     if pkt_header.length != len(msg):
         return None
@@ -34,7 +37,7 @@ def parse_packet(pkt):
 
 
 def send_ack(s, address, seq_num):
-    """Create and send an ACK packet."""
+    """Create and send an individual ACK packet."""
 
     pkt_header = PacketHeader(
         type=3,
@@ -49,7 +52,7 @@ def send_ack(s, address, seq_num):
 
 
 def receiver(receiver_ip, receiver_port, window_size):
-    """Listen on socket and print received message to sys.stdout."""
+    """Listen on socket and receive data using individual ACKs."""
 
     if window_size <= 0:
         raise ValueError("window_size must be positive")
@@ -69,7 +72,7 @@ def receiver(receiver_ip, receiver_port, window_size):
     try:
         while True:
 
-            pkt, address = s.recvfrom(MAX_PACKET_SIZE)
+            pkt, address = s.recvfrom(2048)
 
             result = parse_packet(pkt)
 
@@ -98,7 +101,7 @@ def receiver(receiver_ip, receiver_port, window_size):
                 expected = 1
                 buffer = {}
 
-                # ACK for START
+                # ACK for START has seq_num = 1
                 send_ack(s, sender_address, 1)
 
                 continue
@@ -115,18 +118,21 @@ def receiver(receiver_ip, receiver_port, window_size):
 
                 seq_num = pkt_header.seq_num
 
-                # Duplicate packet
+                # Handle duplicate packets (already delivered)
                 if seq_num < expected:
-                    send_ack(s, sender_address, expected)
+                    send_ack(s, sender_address, seq_num)
                     continue
 
-                # Packet outside receiving window
+                # Drop packets outside the receiving window
                 if seq_num >= expected + window_size:
                     continue
 
-                # Buffer out-of-order packet
+                # Buffer the packet if not already received
                 if seq_num not in buffer:
                     buffer[seq_num] = msg
+
+                # Send individual ACK with the DATA packet's seq_num
+                send_ack(s, sender_address, seq_num)
 
                 # Deliver consecutive packets in order
                 while expected in buffer:
@@ -138,9 +144,6 @@ def receiver(receiver_ip, receiver_port, window_size):
                     expected += 1
 
                 sys.stdout.buffer.flush()
-
-                # Send cumulative ACK
-                send_ack(s, sender_address, expected)
 
             # --------------------------------
             # 3. Handle END packet
@@ -163,9 +166,6 @@ def receiver(receiver_ip, receiver_port, window_size):
                     sys.stdout.buffer.flush()
 
                     break
-
-                else:
-                    send_ack(s, sender_address, expected)
 
     finally:
         s.close()

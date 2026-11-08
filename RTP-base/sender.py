@@ -64,7 +64,7 @@ def receive_ack(sock, receiver, deadline):
 
         try:
             packet, address = sock.recvfrom(2048)
-        except socket.timeout:
+        except (socket.timeout, OSError):
             return None
 
         # Check source IP, but do not require the same UDP port.
@@ -103,16 +103,15 @@ def sender(receiver_ip, receiver_port, window_size):
 
         s.sendto(start_pkt, receiver)
 
-        start_deadline = time.monotonic() + TIMEOUT
-
         while True:
+            start_deadline = time.monotonic() + TIMEOUT
             ack = receive_ack(s, receiver, start_deadline)
 
             if ack == 1:
                 break
 
             if ack is None:
-                raise TimeoutError("No ACK received for START packet")
+                s.sendto(start_pkt, receiver)
 
         # 4. Initialize sliding window
         base = 1

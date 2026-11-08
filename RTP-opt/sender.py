@@ -64,7 +64,7 @@ def receive_ack(sock, receiver, deadline):
 
         try:
             packet, address = sock.recvfrom(2048)
-        except socket.timeout:
+        except (socket.timeout, OSError):
             return None
 
         # Check source IP, but do not require the same UDP port.
@@ -78,7 +78,7 @@ def receive_ack(sock, receiver, deadline):
 
 
 def sender(receiver_ip, receiver_port, window_size):
-    """Send message from stdin using reliable UDP."""
+    """Send message from stdin using reliable UDP with selective repeat."""
 
     if window_size <= 0:
         raise ValueError("window_size must be positive")
@@ -103,22 +103,22 @@ def sender(receiver_ip, receiver_port, window_size):
 
         s.sendto(start_pkt, receiver)
 
-        start_deadline = time.monotonic() + TIMEOUT
-
         while True:
+            start_deadline = time.monotonic() + TIMEOUT
             ack = receive_ack(s, receiver, start_deadline)
 
             if ack == 1:
                 break
 
             if ack is None:
-                raise TimeoutError("No ACK received for START packet")
+                s.sendto(start_pkt, receiver)
 
         # 4. Initialize sliding window
         base = 1
         next_seq = 1
 
-        # Store packets that have not been acknowledged
+        # Store packets and their ACK status in the current window:
+        # window[seq] = {'pkt': bytes, 'acked': bool}
         window = {}
 
         timer = None
@@ -141,7 +141,10 @@ def sender(receiver_ip, receiver_port, window_size):
 
                 s.sendto(pkt, receiver)
 
-                window[next_seq] = pkt
+                window[next_seq] = {
+                    'pkt': pkt,
+                    'acked': False
+                }
 
                 if timer is None:
                     timer = time.monotonic() + TIMEOUT
@@ -151,31 +154,34 @@ def sender(receiver_ip, receiver_port, window_size):
             # Wait for ACK
             ack_seq = receive_ack(s, receiver, timer)
 
-            # 6. Timeout: retransmit all unacknowledged packets
+            # 6. Timeout: retransmit only unacknowledged packets in current window
             if ack_seq is None:
 
-                for pkt in window.values():
-                    s.sendto(pkt, receiver)
+                for item in window.values():
+                    if not item['acked']:
+                        s.sendto(item['pkt'], receiver)
 
                 timer = time.monotonic() + TIMEOUT
                 continue
 
-            # 7. Process cumulative ACK
-            if base < ack_seq <= next_seq:
+            # 7. Process individual ACK
+            if ack_seq in window:
+                window[ack_seq]['acked'] = True
 
-                # Move the window forward
-                base = ack_seq
+                # Slide the window forward if the base packet has been acknowledged
+                advanced = False
+                while base in window and window[base]['acked']:
+                    del window[base]
+                    base += 1
+                    advanced = True
 
-                # Remove acknowledged packets
-                for seq in list(window.keys()):
-                    if seq < base:
-                        del window[seq]
-
-                # Reset timer
-                if window:
-                    timer = time.monotonic() + TIMEOUT
-                else:
-                    timer = None
+                # Reset or stop the timer if the window moved forward
+                if advanced:
+                    has_unacked = any(not item['acked'] for item in window.values())
+                    if has_unacked:
+                        timer = time.monotonic() + TIMEOUT
+                    else:
+                        timer = None
 
         # 8. Send END packet
         end_seq = total_packets + 1
